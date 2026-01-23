@@ -289,7 +289,18 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             if "p2c" in self.pos_att_type:
                 pos_query = torch.einsum("bqhd,zhmd->bqhm", key_layer, pos_query_layer)
 
-            (query_layer, 
+
+            # Convert 4D attention_mask [B, 1, L, L] to 2D [B, L] for _upad_input
+            if attention_mask.dim() == 4:
+                mask_2d = attention_mask[:, 0, :, :].sum(dim=-1) > 0
+            elif attention_mask.dim() == 3:
+                # [B, L, L] -> [B, L]
+                mask_2d = attention_mask.sum(dim=-1) > 0
+            else:
+                # Already 2D [B, L]
+                mask_2d = attention_mask
+
+            (query_layer,
              key_layer,
              value_layer,
              pos_key,
@@ -302,7 +313,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 value_layer,
                 pos_key,
                 pos_query,
-                attention_mask,
+                mask_2d,
                 L,
                 self.num_attention_heads)
 
@@ -435,7 +446,8 @@ DEBERTA_SELF_ATTENTION_CLASSES = {
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
         super().__init__(config)
-        self.self = DEBERTA_SELF_ATTENTION_CLASSES[config._attn_implementation](config)
+        # self.self = DEBERTA_SELF_ATTENTION_CLASSES[config._attn_implementation](config)
+        self.self = FlashDisentangledSelfAttention(config)
         self.output = DebertaV2SelfOutput(config)
         self.config = config
 
