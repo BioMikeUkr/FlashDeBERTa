@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 from flashdeberta.model import FlashDisentangledSelfAttention
 from transformers.models.deberta_v2.modeling_deberta_v2 import DisentangledSelfAttention
@@ -88,8 +89,16 @@ def compare_flash_and_deberta_backward(
         "rel_grad_mean_abs_diff": float or nan,
         "param_grad_max_abs_diff": float,
         "param_grad_mean_abs_diff": float,
-        "per_param": {name: metrics_dict, ...},   # <── NEW
-        "failed_params": [names...],              # <── NEW
+        "per_param": {name: metrics_dict, ...},
+        "failed_params": [names...],
+        "deberta_fwd_time": float (seconds),
+        "deberta_bwd_time": float (seconds),
+        "flash_fwd_time": float (seconds),
+        "flash_bwd_time": float (seconds),
+        "deberta_fwd_memory": float (MB),
+        "deberta_bwd_memory": float (MB),
+        "flash_fwd_memory": float (MB),
+        "flash_bwd_memory": float (MB),
       }
     """
     torch.manual_seed(seed)
@@ -114,7 +123,7 @@ def compare_flash_and_deberta_backward(
     rel_embeddings_b = rel_embeddings_a.detach().clone().requires_grad_(True)
 
     # Config + models
-    num_attention_heads = 8
+    num_attention_heads = 12
     assert hidden_size % num_attention_heads == 0
     config = DummyConfig(
         hidden_size=hidden_size,
@@ -130,18 +139,69 @@ def compare_flash_and_deberta_backward(
     deberta_model.eval()
     flash_model.eval()
 
-    # Forward
+    # Warmup runs for accurate timing
+    if device == "cuda":
+        warmup_iterations = 3
+        for _ in range(warmup_iterations):
+            # Warmup DeBERTa
+            out_warmup_a, _ = deberta_model(hidden_states_a, extended_attention_mask, rel_embeddings=rel_embeddings_a)
+            grad_warmup = torch.randn_like(out_warmup_a)
+            (out_warmup_a * grad_warmup).sum().backward()
+            for p in deberta_model.parameters():
+                if p.grad is not None: p.grad = None
+            hidden_states_a.grad = None
+            rel_embeddings_a.grad = None
+
+            # Warmup Flash
+            out_warmup_b, _ = flash_model(hidden_states_b, attention_mask, rel_embeddings=rel_embeddings_b)
+            (out_warmup_b * grad_warmup).sum().backward()
+            for p in flash_model.parameters():
+                if p.grad is not None: p.grad = None
+            hidden_states_b.grad = None
+            rel_embeddings_b.grad = None
+
+        torch.cuda.synchronize()
+        if verbose:
+            print(f"Completed {warmup_iterations} warmup iterations")
+
+    # Timing and memory tracking
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    # Forward - DeBERTa
+    t0 = time.perf_counter()
     out_a, _ = deberta_model(hidden_states_a, extended_attention_mask, rel_embeddings=rel_embeddings_a)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    deberta_fwd_time = time.perf_counter() - t0
+    deberta_fwd_memory = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0.0
+
+    # Reset for Flash
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    # Forward - Flash
+    t0 = time.perf_counter()
     out_b, _ = flash_model(hidden_states_b, attention_mask, rel_embeddings=rel_embeddings_b)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    flash_fwd_time = time.perf_counter() - t0
+    flash_fwd_memory = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0.0
 
     diff = (out_a - out_b).abs().mean().item()
     if verbose:
-        print(f"[Forward test — {mode}] dtype={dtype}, atol={atol}, rtol={rtol}")
-        print("Mean absolute difference between outputs:", diff)
+        print(f"\n[Forward test — {mode}] dtype={dtype}, atol={atol}, rtol={rtol}")
+        print(f" Mean absolute difference between outputs: {diff:.3e}")
         passed = True if diff < rtol else False
-        print(f"Forward passed: {passed}.")
+        print(f" Forward passed: {passed}")
     # Identical upstream grad
+    # For varlen comparison, we must zero gradients at masked positions
+    # since flash varlen discards these while native DeBERTa may propagate them
     grad_out = torch.randn_like(out_a)
+    if varlen:
+        grad_out = grad_out * attention_mask.unsqueeze(-1).float()
 
     # Zero param grads
     for p in deberta_model.parameters():
@@ -149,9 +209,27 @@ def compare_flash_and_deberta_backward(
     for p in flash_model.parameters():
         if p.grad is not None: p.grad = None
 
-    # Backward
+    # Backward - DeBERTa
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
     (out_a * grad_out).sum().backward()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    deberta_bwd_time = time.perf_counter() - t0
+    deberta_bwd_memory = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0.0
+
+    # Backward - Flash
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
     (out_b * grad_out.detach().clone()).sum().backward()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    flash_bwd_time = time.perf_counter() - t0
+    flash_bwd_memory = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0.0
 
     # ---- Inputs ----
     in_diff = (hidden_states_a.grad - hidden_states_b.grad).detach()
@@ -195,11 +273,23 @@ def compare_flash_and_deberta_backward(
         passed &= (rel_max <= atol) or (rel_max <= rtol * max(1e-8, rel_max))
 
     if verbose:
-        print(f"[Backward test — {mode}] dtype={dtype}, atol={atol}, rtol={rtol}")
-        print(f" Input grad   diff: max={in_max:.3e}, mean={in_mean:.3e}")
+        print(f"\n[Backward test — {mode}] dtype={dtype}, atol={atol}, rtol={rtol}")
+        print(f"\n Performance Metrics:")
+        print(f"  DeBERTa:  fwd={deberta_fwd_time*1000:.2f}ms  bwd={deberta_bwd_time*1000:.2f}ms  total={1000*(deberta_fwd_time+deberta_bwd_time):.2f}ms")
+        print(f"  Flash:    fwd={flash_fwd_time*1000:.2f}ms  bwd={flash_bwd_time*1000:.2f}ms  total={1000*(flash_fwd_time+flash_bwd_time):.2f}ms")
+        if flash_fwd_time > 0 and flash_bwd_time > 0:
+            print(f"  Speedup:  fwd={deberta_fwd_time/flash_fwd_time:.2f}x  bwd={deberta_bwd_time/flash_bwd_time:.2f}x  total={(deberta_fwd_time+deberta_bwd_time)/(flash_fwd_time+flash_bwd_time):.2f}x")
+        if device == "cuda":
+            print(f"\n Memory Usage (MB):")
+            print(f"  DeBERTa:  fwd={deberta_fwd_memory:.2f}MB  bwd={deberta_bwd_memory:.2f}MB")
+            print(f"  Flash:    fwd={flash_fwd_memory:.2f}MB  bwd={flash_bwd_memory:.2f}MB")
+            if flash_fwd_memory > 0 and flash_bwd_memory > 0:
+                print(f"  Savings:  fwd={deberta_fwd_memory/flash_fwd_memory:.2f}x  bwd={deberta_bwd_memory/flash_bwd_memory:.2f}x")
+        print(f"\n Gradient Differences:")
+        print(f"  Input grad   diff: max={in_max:.3e}, mean={in_mean:.3e}")
         if not math.isnan(rel_max):
-            print(f" Rel-emb grad diff: max={rel_max:.3e}, mean={rel_mean:.3e}")
-        print(f" Param grad   diff: max={param_max:.3e}, mean(max_abs)={param_mean:.3e}")
+            print(f"  Rel-emb grad diff: max={rel_max:.3e}, mean={rel_mean:.3e}")
+        print(f"  Param grad   diff: max={param_max:.3e}, mean(max_abs)={param_mean:.3e}")
         # Show top-K by max_abs diff
         if per_param:
             top = sorted(per_param.values(), key=lambda r: r["max_abs"], reverse=True)[:print_top_k]
@@ -220,14 +310,22 @@ def compare_flash_and_deberta_backward(
         "rel_grad_mean_abs_diff": rel_mean,
         "param_grad_max_abs_diff": param_max,
         "param_grad_mean_abs_diff": param_mean,
-        "per_param": per_param,           # name -> metrics dict
-        "failed_params": failed_params,   # list of names
+        "per_param": per_param,
+        "failed_params": failed_params,
+        "deberta_fwd_time": deberta_fwd_time,
+        "deberta_bwd_time": deberta_bwd_time,
+        "flash_fwd_time": flash_fwd_time,
+        "flash_bwd_time": flash_bwd_time,
+        "deberta_fwd_memory": deberta_fwd_memory,
+        "deberta_bwd_memory": deberta_bwd_memory,
+        "flash_fwd_memory": flash_fwd_memory,
+        "flash_bwd_memory": flash_bwd_memory,
     }
 
 # Example
 if __name__ == "__main__":
     _ = compare_flash_and_deberta_backward(
-        B=2, L=128, hidden_size=256,
+        B=2, L=4096, hidden_size=768,
         pos_att_type=["p2c", "c2p"],
-        varlen=False, verbose=True, print_top_k=30
+        varlen=True, verbose=True, print_top_k=30
     )

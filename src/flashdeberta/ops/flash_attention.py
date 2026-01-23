@@ -343,7 +343,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
     if capability[0] >= 8 :
         if not causal:
             if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
                 if M <= 1024:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
@@ -352,7 +352,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
         else:  # causal
             if D <= 64:
                 if disentangled:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
                 else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
             else:
@@ -363,7 +363,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
     elif capability[0] == 8:
         if not causal:
             if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
         else:  # causal
@@ -395,21 +395,13 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
         if num_stages > 1:
             num_stages -= 1
         # Then try reducing block sizes
-        if BLOCK_M > 32 and BLOCK_N > 32:
+        else:
             BLOCK_M //= 2
-            BLOCK_N //= 2
-        elif BLOCK_M > 32:
-            BLOCK_M //= 2
-        elif BLOCK_N > 32:
-            BLOCK_N //= 2
-        elif BLOCK_M > 16:
-            BLOCK_M //= 2
-        elif BLOCK_N > 16:
             BLOCK_N //= 2
         
         # Recalculate with new parameters
         shared_mem_usage = calculate_shared_memory_usage(
-            BLOCK_M, BLOCK_N, D, num_stages, dtype, 
+            BLOCK_M, BLOCK_N, D, num_stages, dtype,
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
         )
 
@@ -520,9 +512,9 @@ def get_bwd_config(
 
     if cap[0] >= 9:
         if D <= 64:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = (128, 64, 3, 4) if not causal else (128, 64, 3, 4)
+            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if not causal else (64, 64, 3, 4)
         else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = (128, 64, 2, 8) if not causal else (128, 64, 2, 8)
+            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 2, 8) if not causal else (64, 64, 2, 8)
     elif cap[0] >= 8:
         if D <= 64:
             if causal:
@@ -552,19 +544,16 @@ def get_bwd_config(
     while shm > max_shared_memory and (num_stages > 1 or BLOCK_M > 16 or BLOCK_N > 16):
         if num_stages > 1:
             num_stages -= 1
-        elif BLOCK_N >= BLOCK_M and BLOCK_N > 16:
-            BLOCK_N = halve_pow2(BLOCK_N)
-        elif BLOCK_M > 16:
-            BLOCK_M = halve_pow2(BLOCK_M)
+        # Then try reducing block sizes
         else:
-            break  # nothing else to shrink
+            BLOCK_M //= 2
+            BLOCK_N //= 2
 
         shm = calculate_shared_memory_usage_bwd(
             BLOCK_M, BLOCK_N, D, num_stages, dtype,
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN,
             store_lse=True, recompute_probs=True, accum_dq=True, accum_dkv=True,
         )
-
     if D <= 64 and BLOCK_M * BLOCK_N <= 128 * 64:
         num_warps = min(num_warps, 4)
     else:
