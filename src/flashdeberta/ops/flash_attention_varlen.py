@@ -341,6 +341,17 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
     Returns:
         Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
     """
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
+                                          'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
+        )
+
     # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
 
     capability_map = {
@@ -542,6 +553,17 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens
 
 def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seqlen_k, D, causal,
                           *, disentangled=True, att_span=256, dtype=torch.float16, max_shared_memory=None):
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
+                                          'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_WARPS'])
+        )
+
     # Very close to your fixed-len get_bwd_config, with small tweaks for varlen
     capability_map = {
         (7,0):  96000, (7,2):  96000, (7,5):  64000,

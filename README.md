@@ -45,6 +45,39 @@ In order to switch to eager attention implementation, initialise a model in the 
 model = FlashDebertaV2Model.from_pretrained("microsoft/deberta-v3-base", _attn_implementation='eager').to('cuda')
 ```
 
+### Kernel Tuning ⚙️
+
+FlashDeBERTa automatically selects optimal kernel parameters based on your GPU. For advanced users who want to fine-tune performance, you can override these defaults using environment variables:
+
+```bash
+# Configure forward pass
+export FLASHDEBERTA_FWD_BLOCK_M=128
+export FLASHDEBERTA_FWD_BLOCK_N=64
+export FLASHDEBERTA_FWD_NUM_STAGES=3
+export FLASHDEBERTA_FWD_NUM_WARPS=4
+
+# Configure backward pass (optional)
+export FLASHDEBERTA_BWD_BLOCK_M=64
+export FLASHDEBERTA_BWD_BLOCK_N=64
+export FLASHDEBERTA_BWD_NUM_STAGES=2
+export FLASHDEBERTA_BWD_NUM_WARPS=4
+
+python train.py
+```
+
+Or set them directly in Python before importing:
+```python
+import os
+os.environ['FLASHDEBERTA_FWD_BLOCK_M'] = '128'
+os.environ['FLASHDEBERTA_FWD_BLOCK_N'] = '64'
+os.environ['FLASHDEBERTA_FWD_NUM_STAGES'] = '3'
+os.environ['FLASHDEBERTA_FWD_NUM_WARPS'] = '4'
+
+from flashdeberta import FlashDebertaV2Model
+```
+
+**Note:** All four parameters must be set together to take effect. Typical values: BLOCK_M/N ∈ {32, 64, 128}, num_stages ∈ {1, 2, 3, 4}, num_warps ∈ {4, 8}.
+
 ### Benchmarks
 
 While context-to-position and position-to-context biases still require quadratic memory, our flash attention implementation reduces overall memory requirements to nearly linear. This efficiency is particularly impactful for longer sequences. Starting from 512 tokens, FlashDeBERTa achieves more than a 50% performance improvement, and at 4k tokens, it's over 5 times faster than naive implementations.

@@ -313,6 +313,17 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
     Returns:
         Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
     """
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
+                                          'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
+        )
+
     # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
 
     capability_map = {
@@ -491,6 +502,17 @@ def get_bwd_config(
     Heuristic selector for backward kernel tiling.
     Returns (BLOCK_M, BLOCK_N, num_stages, num_warps).
     """
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
+                                          'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_WARPS'])
+        )
+
     capability_map = {
         (7,0):  96000, (7,2):  96000, (7,5):  64000,
         (8,0): 163000, (8,6):  99000, (8,7): 163000, (8,9):  99000,

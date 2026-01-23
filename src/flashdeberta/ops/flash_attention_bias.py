@@ -180,6 +180,18 @@ def flash_attn_v2_bwd(o, do, q, k, v, bias, L, causal, sm_scale, BLOCK_M, BLOCK_
 # --------------------------- Forward ---------------------------
 # NOTE: this function can be overwritten at runtime to use your custom config
 def get_fwd_config(B, H, M, N, D, causal):
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
+                                          'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
+        )
+
+    # Default GPU-based configuration
     if torch.cuda.get_device_capability() == (8, 0):
         if not causal:
             if D <= 64:
@@ -374,6 +386,18 @@ def _fwd_kernel(
 # --------------------------- Backward ---------------------------
 # NOTE: this function can be overwritten at runtime to use your custom config
 def get_bwd_config(B, H, M, N, D, causal):
+    # Check environment variables first for user override
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
+                                          'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_BWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_BWD_NUM_WARPS'])
+        )
+
+    # Default GPU-based configuration
     if torch.cuda.get_device_capability() == (8, 0):
         if not causal:
             BLOCK_M = 128 if D <= 64 else 64
