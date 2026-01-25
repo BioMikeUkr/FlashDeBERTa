@@ -3,6 +3,8 @@ import torch
 import triton
 import warnings
 import triton.language as tl
+import functools
+from typing import Tuple, Dict, Any
 
 def calculate_shared_memory_usage_varlen(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_stages, dtype, 
                                          has_c2p=False, has_p2c=False, ATT_SPAN=0):
@@ -180,6 +182,84 @@ def get_mid(cu_seqlens_q, B, BLOCK_M):
             mid_batch.append(batch)
     return (mid_batch, mid_start, MN)
 
+
+@functools.lru_cache(maxsize=256)
+def _get_mid_cached(cu_seqlens_tuple: Tuple[int, ...], B: int, BLOCK_M: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+    """
+    Cached version of get_mid that works with hashable tuple input.
+    Returns tuples instead of lists for cacheability.
+    """
+    mid_batch = []
+    mid_start = []
+    MN = 0
+    for batch in range(B):
+        q_start = cu_seqlens_tuple[batch]
+        q_end = cu_seqlens_tuple[batch + 1]
+        n_batch_blocks = (q_end - q_start + BLOCK_M - 1) // BLOCK_M
+        MN += n_batch_blocks
+        for block in range(n_batch_blocks):
+            mid_start.append(q_start + block * BLOCK_M)
+            mid_batch.append(batch)
+    return (tuple(mid_batch), tuple(mid_start), MN)
+
+
+# Global tensor cache for mid tensors (avoid repeated CPU->GPU transfers)
+_mid_tensor_cache: Dict[Tuple[Any, ...], Tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+
+@torch.compiler.disable
+def get_mid_cached(cu_seqlens: torch.Tensor, B: int, BLOCK_M: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Get cached mid_batch and mid_start tensors.
+    Caches both the computation and the GPU tensors to avoid repeated allocations.
+
+    Note: Disabled for torch.compile as it involves CPU operations.
+    """
+    # Create cache key from cu_seqlens values
+    cu_tuple = tuple(cu_seqlens.tolist())
+    cache_key = (cu_tuple, B, BLOCK_M, device)
+
+    if cache_key in _mid_tensor_cache:
+        return _mid_tensor_cache[cache_key]
+
+    # Compute using cached function
+    mid_batch_tuple, mid_start_tuple, MN = _get_mid_cached(cu_tuple, B, BLOCK_M)
+
+    # Create tensors on device
+    mid_batch = torch.tensor(mid_batch_tuple, dtype=torch.long, device=device)
+    mid_start = torch.tensor(mid_start_tuple, dtype=torch.long, device=device)
+
+    # Cache the result (limit cache size)
+    if len(_mid_tensor_cache) > 512:
+        # Simple eviction: clear half the cache
+        keys_to_remove = list(_mid_tensor_cache.keys())[:256]
+        for k in keys_to_remove:
+            del _mid_tensor_cache[k]
+
+    _mid_tensor_cache[cache_key] = (mid_batch, mid_start, MN)
+    return mid_batch, mid_start, MN
+
+
+def clear_mid_cache():
+    """
+    Clear the mid tensor cache. Call this if memory is a concern.
+    Note: This only clears the mid tensor cache, not the config caches.
+    Use clear_config_cache_varlen() to clear config caches.
+    """
+    _mid_tensor_cache.clear()
+    _get_mid_cached.cache_clear()
+
+def clear_config_cache_varlen():
+    """Clear the configuration caches for varlen kernels."""
+    _get_fwd_config_cached.cache_clear()
+    _get_bwd_config_varlen_cached.cache_clear()
+
+def clear_all_varlen_caches():
+    """Clear all caches for varlen kernels (both mid tensors and configs)."""
+    clear_mid_cache()
+    clear_config_cache_varlen()
+
+
 @triton.jit
 def _fwd_kernel_deberta_disentangled_attention(
     Q, K, V,
@@ -233,12 +313,6 @@ def _fwd_kernel_deberta_disentangled_attention(
 
     mask_m = offs_m < q_end
     q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
-
-    if BLOCK_DMODEL < 128:
-        I = tl.where(offs_k[:, None] == offs_k,
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype))
-        q = tl.dot(q, I).to(input_dtype)
 
     if IS_CAUSAL:
         hi = tl.minimum(lN, P_SEQ + (off_m + 1) * BLOCK_M)
@@ -325,23 +399,11 @@ def _fwd_kernel_deberta_disentangled_attention(
     tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
 
 
-def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentangled=False, att_span=256):
+@functools.lru_cache(maxsize=128)
+def _get_fwd_config_cached(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentangled, att_span):
     """
-    Determine optimal kernel configuration parameters for variable-length sequences.
-
-    Args:
-        total_tokens: Total number of tokens across all batches
-        max_seqlen_q: Maximum query sequence length
-        max_seqlen_k: Maximum key sequence length
-        D: Per-head dimension
-        causal: Whether causal masking is applied
-        disentangled: Whether to use DeBERTa-style disentangled attention
-        att_span: Size of the attention span for relative positions
-
-    Returns:
-        Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    Cached version of configuration computation for variable-length forward pass.
     """
-    # Check environment variables first for user override
     import os
     if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
                                           'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
@@ -351,8 +413,6 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
             int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
             int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
         )
-
-    # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
 
     capability_map = {
          (7,0): 96000,
@@ -364,8 +424,8 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
          (8,9): 99000,
          (9,0): 227000,
          }
-    
-    capability = torch.cuda.get_device_capability() 
+
+    capability = torch.cuda.get_device_capability()
     device_property = torch.cuda.get_device_properties()
     if hasattr(device_property,"shared_memory_per_block_optin"):
         shared_mem_per_block = device_property.shared_memory_per_block_optin
@@ -376,11 +436,16 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
     else:
         shared_mem_per_block = 48000
 
-    max_shared_memory = shared_mem_per_block - 2000 # remove 2kb for ops overhead
-    
-    # Start with an aggressive configuration
+    max_shared_memory = shared_mem_per_block - 2000
+
     if capability[0] >= 8:
-        if not causal:
+        if max_seqlen_q <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif max_seqlen_q <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif max_seqlen_q <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif not causal:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
@@ -388,7 +453,7 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
                 else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 8
-        else:  # causal
+        else:
             if D <= 64:
                 if disentangled:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
@@ -405,55 +470,66 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
-        else:  # causal
+        else:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 1, 4
-    
-    # Additional adjustments for variable-length sequences
-    
-    # For very sparse batches (many short sequences), reduce block size
+
     avg_seq_len = total_tokens / max(1, torch.cuda.device_count())
     if avg_seq_len < 256:
         BLOCK_M = min(BLOCK_M, 64)
         BLOCK_N = min(BLOCK_N, 32)
-        num_stages = max(1, num_stages - 1)  # Reduce stages to save memory
-    
-    # Calculate shared memory usage with current config
+        num_stages = max(1, num_stages - 1)
+
     has_pos = disentangled
     ATT_SPAN = att_span if has_pos else 0
-    
-    dtype = torch.float16  # Assuming float16 is used as in original code
-    
+
+    dtype = torch.float16
+
     shared_mem_usage = calculate_shared_memory_usage_varlen(
         BLOCK_M, BLOCK_N, D, num_stages, dtype,
         has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
     )
-    
-    # If shared memory usage exceeds available, adjust parameters
-    # We prioritize reducing num_stages first, then block sizes
+
     while shared_mem_usage > max_shared_memory and (BLOCK_M > 16 or BLOCK_N > 16 or num_stages > 1):
-        # First try reducing num_stages
         if num_stages > 1:
             num_stages -= 1
-        # Then try reducing block sizes
         else:
             BLOCK_M //= 2
             BLOCK_N //= 2
-        
-        # Recalculate with new parameters
+
         shared_mem_usage = calculate_shared_memory_usage_varlen(
             BLOCK_M, BLOCK_N, D, num_stages, dtype,
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
         )
-    
-    warnings.warn(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.\n"
-                  "INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
 
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentangled=False, att_span=256):
+    """
+    Determine optimal kernel configuration parameters for variable-length sequences.
+
+    Args:
+        total_tokens: Total number of tokens across all batches
+        max_seqlen_q: Maximum query sequence length
+        max_seqlen_k: Maximum key sequence length
+        D: Per-head dimension
+        causal: Whether causal masking is applied
+        disentangled: Whether to use DeBERTa-style disentangled attention
+        att_span: Size of the attention span for relative positions
+
+    Returns:
+        Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    """
+    config = _get_fwd_config_cached(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentangled, att_span)
+
+    warnings.warn(f"INFO: Variable-length forward config is {config[0]}, {config[1]}, {config[2]}, {config[3]} for BLOCK_M, BLOCK_N stages and warps, respectively.\n"
+                  "INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
+
+    return config
 
 
 
@@ -502,10 +578,8 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens
     B = len(cu_seqlens_q)-1
     Z, H, D = q.shape
 
-    mid_batch, mid_start, MN = get_mid(cu_seqlens_q, B, BLOCK_M)
-
-    mid_batch = torch.LongTensor(mid_batch).to(q.device)
-    mid_start = torch.LongTensor(mid_start).to(q.device)
+    # Use cached mid tensors to reduce CPU overhead
+    mid_batch, mid_start, MN = get_mid_cached(cu_seqlens_q, B, BLOCK_M, q.device)
 
     # Determine if each bias term is present.
     has_c2p = pos_key is not None
@@ -551,9 +625,13 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens
     return o, L
 
 
-def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seqlen_k, D, causal,
-                          *, disentangled=True, att_span=256, dtype=torch.float16, max_shared_memory=None):
-    # Check environment variables first for user override
+@functools.lru_cache(maxsize=128)
+def _get_bwd_config_varlen_cached(total_tokens_q, total_tokens_k, max_seqlen_q, max_seqlen_k, D, causal,
+                                   disentangled, att_span, dtype_size):
+    """
+    Cached version of configuration computation for variable-length backward pass.
+    dtype_size: 2 for float16/bfloat16, 4 for float32
+    """
     import os
     if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
                                           'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
@@ -564,7 +642,6 @@ def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seql
             int(os.environ['FLASHDEBERTA_BWD_NUM_WARPS'])
         )
 
-    # Very close to your fixed-len get_bwd_config, with small tweaks for varlen
     capability_map = {
         (7,0):  96000, (7,2):  96000, (7,5):  64000,
         (8,0): 163000, (8,6):  99000, (8,7): 163000, (8,9):  99000,
@@ -573,31 +650,43 @@ def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seql
     cap = torch.cuda.get_device_capability()
     prop = torch.cuda.get_device_properties(0)
 
-    if max_shared_memory is None:
-        if hasattr(prop, "shared_memory_per_block_optin"):
-            shared_mem_per_block = prop.shared_memory_per_block_optin
-        elif cap in capability_map:
-            shared_mem_per_block = capability_map[cap]
-        elif cap[0] >= 8:
-            shared_mem_per_block = 99000
-        else:
-            shared_mem_per_block = 48000
-        max_shared_memory = max(0, shared_mem_per_block - 2048)
-
-    # Initial guess
-    if cap[0] >= 9:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if D <= 64 else (64, 64, 2, 8)
+    if hasattr(prop, "shared_memory_per_block_optin"):
+        shared_mem_per_block = prop.shared_memory_per_block_optin
+    elif cap in capability_map:
+        shared_mem_per_block = capability_map[cap]
     elif cap[0] >= 8:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if D <= 64 else (64, 64, 2, 8)
+        shared_mem_per_block = 99000
+    else:
+        shared_mem_per_block = 48000
+    max_shared_memory = max(0, shared_mem_per_block - 2048)
+
+    if cap[0] >= 8:
+        if max_seqlen_q <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif max_seqlen_q <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif max_seqlen_q <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif cap[0] >= 9:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if D <= 64 else (64, 64, 2, 8)
+        else:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if D <= 64 else (64, 64, 2, 8)
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
 
-    # If keys are much longer than queries, prefer wider N tiles
-    if max_seqlen_k >= 2 * max_seqlen_q and BLOCK_N < 128 and cap[0] >= 8:
+    if max_seqlen_q > 256 and max_seqlen_k >= 2 * max_seqlen_q and BLOCK_N < 128 and cap[0] >= 8:
         BLOCK_N = 128
         num_warps = max(num_warps, 8)
 
     ATT_SPAN = att_span if disentangled else 0
+
+    # Convert dtype_size back to dtype for calculation
+    if dtype_size == 2:
+        dtype = torch.float16
+    elif dtype_size == 4:
+        dtype = torch.float32
+    else:
+        dtype = torch.float16
 
     shm = calculate_shared_memory_usage_varlen_bwd(
         BLOCK_M, BLOCK_N, D, num_stages, dtype,
@@ -626,11 +715,30 @@ def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seql
     else:
         num_warps = max(num_warps, 8 if cap[0] >= 8 else 4)
 
+    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_bwd_config_varlen(total_tokens_q, total_tokens_k, max_seqlen_q, max_seqlen_k, D, causal,
+                          *, disentangled=True, att_span=256, dtype=torch.float16, max_shared_memory=None):
+    """
+    Determine optimal kernel configuration parameters for variable-length backward pass.
+    Uses caching to avoid recomputing configurations for the same inputs.
+    """
+    # Convert dtype to size for caching (dtypes are not hashable)
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        dtype_size = 2
+    elif dtype == torch.float32:
+        dtype_size = 4
+    else:
+        dtype_size = 2
+
+    config = _get_bwd_config_varlen_cached(total_tokens_q, total_tokens_k, max_seqlen_q, max_seqlen_k, D, causal,
+                                            disentangled, att_span, dtype_size)
+
     warnings.warn(
         f"INFO: Varlen backward config -> "
-        f"BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, stages={num_stages}, warps={num_warps}."
+        f"BLOCK_M={config[0]}, BLOCK_N={config[1]}, stages={config[2]}, warps={config[3]}."
     )
-    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    return config
 
 @triton.jit
 def _bwd_preprocess_varlen(
@@ -814,13 +922,15 @@ def _bwd_kv_dise_kernel_varlen(
         if HAS_C2P:
             kpos_base = DKPOS + (offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1)
             kpos_ptrs = kpos_base + c2p_index * stride_pk2
-            tl.atomic_add(kpos_ptrs, ds_scaled, mask=mask_m[:, None] & mask_n[None, :] & (c2p_index < 2*ATT_SPAN))
+            tl.atomic_add(kpos_ptrs, ds_scaled, mask=mask_m[:, None] & mask_n[None, :] & (c2p_index < 2*ATT_SPAN),
+                          sem="relaxed")
 
         if HAS_P2C:
             qpos_base = DQPOS + (offs_n_abs[:, None] * stride_pq0 + off_h * stride_pq1)
             qpos_ptrs = qpos_base + p2c_index * stride_pq2
             tl.atomic_add(qpos_ptrs, ds_scaled.trans(1, 0),
-                          mask=mask_n[:, None] & mask_m[None, :] & (p2c_index < 2*ATT_SPAN))
+                          mask=mask_n[:, None] & mask_m[None, :] & (p2c_index < 2*ATT_SPAN),
+                          sem="relaxed")
 
     # store dk/dv
     dk_ptrs = DK + (offs_n_abs[:, None] * stride_dkz + offs_k[None, :] * stride_dkk + off_h * stride_dkh)
@@ -970,13 +1080,9 @@ def flash_attn_v2_bwd_dise_varlen(
     BN = k.shape[0]
     B = cu_seqlens_q.numel() - 1
 
-    # Build M- and N- tile mappings
-    mid_m_batch, mid_m_start, MN = get_mid(cu_seqlens_q, B, BLOCK_M)
-    mid_n_batch, mid_n_start, NK = get_mid(cu_seqlens_k, B, BLOCK_N)
-    mid_m_batch = torch.LongTensor(mid_m_batch).to(device)
-    mid_m_start = torch.LongTensor(mid_m_start).to(device)
-    mid_n_batch = torch.LongTensor(mid_n_batch).to(device)
-    mid_n_start = torch.LongTensor(mid_n_start).to(device)
+    # Build M- and N- tile mappings using cached tensors
+    mid_m_batch, mid_m_start, MN = get_mid_cached(cu_seqlens_q, B, BLOCK_M, device)
+    mid_n_batch, mid_n_start, NK = get_mid_cached(cu_seqlens_k, B, BLOCK_N, device)
 
     # Δ: (BM, H), L: (BM, H)  — matches kernel pointer math
     delta = torch.empty((BM, H), device=device, dtype=torch.float32)
@@ -1135,16 +1241,27 @@ def flash_attention_with_disentangled_varlen(
     position_buckets=0, max_relative_distance=0,
 ):
     """
-    q:  (BM, H, D)   flattened queries
-    k:  (BN, H, D)
-    v:  (BN, H, D)
-    q_pos: (BM, H, 2*ATT_SPAN) or None
-    k_pos: (BN, H, 2*ATT_SPAN) or None
-    cu_seqlens_q / cu_seqlens_k: int32/64, shape (B+1)
-    max_seqlen_q / max_seqlen_k: int
+    Flash attention with DeBERTa-style disentangled attention for variable-length sequences.
+
+    Args:
+        q:  (BM, H, D)   flattened queries
+        k:  (BN, H, D)
+        v:  (BN, H, D)
+        k_pos: (BM, H, 2*ATT_SPAN) or None - content-to-position bias
+        q_pos: (BN, H, 2*ATT_SPAN) or None - position-to-content bias
+        cu_seqlens_q / cu_seqlens_k: int32/64, shape (B+1)
+        max_seqlen_q / max_seqlen_k: int
+        causal: whether to apply causal masking
+        sm_scale: softmax scale (default: 1/sqrt(D))
+        position_buckets: number of relative position buckets
+        max_relative_distance: maximum relative distance for bucketing
+
+    Returns:
+        Output tensor of shape (BM, H, D)
     """
     return FlashAttentionDisentangledVarlen.apply(
         q, k, v, k_pos, q_pos, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, causal, sm_scale,
         position_buckets, max_relative_distance
     )
+

@@ -19,6 +19,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+import functools
 
 def flash_attn_v2_fwd(q, k, v, bias, causal, sm_scale, BLOCK_M, BLOCK_N, num_warps, num_stages):
 
@@ -179,8 +180,11 @@ def flash_attn_v2_bwd(o, do, q, k, v, bias, L, causal, sm_scale, BLOCK_M, BLOCK_
 
 # --------------------------- Forward ---------------------------
 # NOTE: this function can be overwritten at runtime to use your custom config
-def get_fwd_config(B, H, M, N, D, causal):
-    # Check environment variables first for user override
+@functools.lru_cache(maxsize=128)
+def _get_fwd_config_cached(B, H, M, N, D, causal):
+    """
+    Cached version of configuration computation for forward pass.
+    """
     import os
     if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
                                           'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
@@ -191,38 +195,64 @@ def get_fwd_config(B, H, M, N, D, causal):
             int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
         )
 
-    # Default GPU-based configuration
-    if torch.cuda.get_device_capability() == (8, 0):
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-            else:
-                if M <= 1024:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+    cap = torch.cuda.get_device_capability()
+
+    if cap[0] >= 8:
+        if M <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif M <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif M <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif cap == (8, 0):
+            if not causal:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
                 else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-        else:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
+                    if M <= 1024:
+                        BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+                    else:
+                        BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
             else:
-                if M <= 1024:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
+                else:
+                    if M <= 1024:
+                        BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+                    else:
+                        BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
+        elif cap == (8, 6):
+            if not causal:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+            else:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
                 else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-    elif torch.cuda.get_device_capability() == (8, 6):
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+        else:
+            if not causal:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
             else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-        else: # causal
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_fwd_config(B, H, M, N, D, causal):
+    """
+    Determine optimal kernel configuration parameters for forward pass.
+    Uses caching to avoid recomputing configurations for the same inputs.
+    """
+    return _get_fwd_config_cached(B, H, M, N, D, causal)
 
 
 @triton.jit
@@ -282,27 +312,6 @@ def _fwd_kernel(
     else:
         q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
 
-    #Dot I trick: to place q in registers, it saves shared memory
-    if BLOCK_DMODEL < 128:
-        I = tl.where(offs_k[:, None] == offs_k,
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=input_dtype),
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=input_dtype))
-        q = tl.dot(q, I).to(input_dtype)
-    # else:
-    #     I = tl.where(offs_m_base[:, None] == offs_m_base,
-    #                  tl.full((BLOCK_M, BLOCK_M), 1.0, dtype=input_dtype),
-    #                  tl.full((BLOCK_M, BLOCK_M), 0.0, dtype=input_dtype))
-    #     q = tl.dot(I, q).to(input_dtype)
-
-    # NOTE: Loop-Bound-For-N
-    # The indices in m-dimension that this block may access is in `[start_m * BLOCK_M, (start_m + 1) * BLOCK_M)`.
-    # According to the rule of causal masking, then max index in n-dimension that this block may access
-    # is `P_SEQ + (start_m + 1) * BLOCK_M`.
-    # However, the upper bound of index in n-dimension should never exceed the sequence length of k/v(`P_SEQ + N_CTX`).
-    # `P_SEQ + (start_m + 1) * BLOCK_M` may be larger than `N`.
-    # At this case, there would be illegal memory access when loading k & v tiles
-    # if mask_n is not applied for loading(only when `DIVISIBLE_N`` is true).
-    # See also https://github.com/FlagOpen/FlagAttention/pull/8
     if IS_CAUSAL:
         hi = tl.minimum(N, P_SEQ + (start_m + 1) * BLOCK_M)
         if LARGER_M:
@@ -385,8 +394,11 @@ def _fwd_kernel(
 
 # --------------------------- Backward ---------------------------
 # NOTE: this function can be overwritten at runtime to use your custom config
-def get_bwd_config(B, H, M, N, D, causal):
-    # Check environment variables first for user override
+@functools.lru_cache(maxsize=128)
+def _get_bwd_config_cached(B, H, M, N, D, causal):
+    """
+    Cached version of configuration computation for backward pass.
+    """
     import os
     if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
                                           'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
@@ -397,32 +409,58 @@ def get_bwd_config(B, H, M, N, D, causal):
             int(os.environ['FLASHDEBERTA_BWD_NUM_WARPS'])
         )
 
-    # Default GPU-based configuration
-    if torch.cuda.get_device_capability() == (8, 0):
-        if not causal:
-            BLOCK_M = 128 if D <= 64 else 64
-            BLOCK_N = 64
-            num_stages = 2
-            num_warps = 4
-        else:
-            BLOCK_M = 64
-            BLOCK_N = 64
-            num_stages = 3 if D <= 64 else 2
-            num_warps = 4
-    elif torch.cuda.get_device_capability() == (8, 6): # tune for RTX-3090, device_capability(8, 6)
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+    cap = torch.cuda.get_device_capability()
+
+    if cap[0] >= 8:
+        if M <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif M <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif M <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif cap == (8, 0):
+            if not causal:
+                BLOCK_M = 128 if D <= 64 else 64
+                BLOCK_N = 64
+                num_stages = 2
+                num_warps = 4
             else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 8
-        else:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                BLOCK_M = 64
+                BLOCK_N = 64
+                num_stages = 3 if D <= 64 else 2
+                num_warps = 4
+        elif cap == (8, 6):
+            if not causal:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 8
             else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        else:
+            if not causal:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 8
+            else:
+                if D <= 64:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_bwd_config(B, H, M, N, D, causal):
+    """
+    Determine optimal kernel configuration parameters for backward pass.
+    Uses caching to avoid recomputing configurations for the same inputs.
+    """
+    return _get_bwd_config_cached(B, H, M, N, D, causal)
 
 
 @triton.jit
@@ -906,3 +944,8 @@ def flash_attention_with_bias(q, k, v, bias, causal=False, sm_scale=None):
         out(torch.Tensor): The output. The shape is (batch_size, nheads, seqlen_q, headdim).
     """
     return FlashAttention.apply(q, k, v, bias, causal, sm_scale)
+
+def clear_config_cache():
+    """Clear the configuration cache. Call this if you change devices or need to reset cached configurations."""
+    _get_fwd_config_cached.cache_clear()
+    _get_bwd_config_cached.cache_clear()

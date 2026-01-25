@@ -10,11 +10,7 @@ from transformers.modeling_outputs import (BaseModelOutput, MaskedLMOutput, Sequ
                                         TokenClassifierOutput)
 from transformers.models.deberta_v2.modeling_deberta_v2 import (DisentangledSelfAttention,
                                             DebertaV2Attention,
-                                            DebertaV2SelfOutput,
-                                            DebertaV2Intermediate,
-                                            DebertaV2Output,
                                             DebertaV2Layer,
-                                            ConvLayer,
                                             DebertaV2Embeddings,
                                             DebertaV2Encoder,
                                             DebertaV2Config,
@@ -85,6 +81,20 @@ def build_relative_position(query_layer, key_layer, bucket_size: int = -1, max_p
 def scaled_size_sqrt(query_layer: torch.Tensor, scale_factor: int):
     return torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
 
+
+def _transform_for_scores(x: torch.Tensor, attention_heads: int) -> torch.Tensor:
+    """Transform tensor from (B, L, H*D) to (B, H, L, D)"""
+    new_x_shape = x.size()[:-1] + (attention_heads, -1)
+    x = x.view(new_x_shape).permute(0, 2, 1, 3).contiguous()
+    return x
+
+
+def _get_heads(x: torch.Tensor, attention_heads: int) -> torch.Tensor:
+    """Transform tensor from (B, L, H*D) to (B, L, H, D)"""
+    new_x_shape = x.size()[:-1] + (attention_heads, -1)
+    x = x.view(new_x_shape).contiguous()
+    return x
+
 @torch.jit.script
 def build_rpos(query_layer, key_layer, relative_pos, position_buckets: int, max_relative_positions: int):
     if key_layer.size(-2) != query_layer.size(-2):
@@ -123,7 +133,7 @@ class DebertaV2Config(PretrainedConfig):
         pooler_hidden_act="gelu",
         legacy=True,
         _attn_implementation_autoset = True,
-        _attn_implementation='flash_attention_2',
+        _attn_implementation='eager',
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -159,6 +169,8 @@ class DebertaV2Config(PretrainedConfig):
         self.legacy = legacy
 
 class FlashDisentangledSelfAttention(DisentangledSelfAttention):
+    FLASH_SEQLEN_THRESHOLD = int(__import__('os').environ.get('FLASHDEBERTA_SEQLEN_THRESHOLD', 512)) 
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -193,20 +205,21 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         else:
             varlen = False
 
-        if query_states is None:
-            query_states = hidden_states
-
         B, L, _ = hidden_states.shape
 
-        def transform(x, attention_heads):
-            new_x_shape = x.size()[:-1] + (attention_heads, -1)
-            x = x.view(new_x_shape).permute(0, 2, 1, 3).contiguous()
-            return x
-
-        def get_heads(x, attention_heads):
-            new_x_shape = x.size()[:-1] + (attention_heads, -1)
-            x = x.view(new_x_shape).contiguous()
-            return x
+        seq_len = hidden_states.size(1)
+        if seq_len < self.FLASH_SEQLEN_THRESHOLD and varlen:
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                output_attentions=output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+            )
+        
+        if query_states is None:
+            query_states = hidden_states
 
         query_layer = self.query_proj(query_states)
         key_layer = self.key_proj(hidden_states)
@@ -223,21 +236,21 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         if self.relative_attention:
             rel_embeddings = self.pos_dropout(rel_embeddings)
             if self.share_att_key:
-                pos_key_layer = transform(
+                pos_key_layer = _transform_for_scores(
                     self.key_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
                 ) # (1, NH, MD, head_dim)
-                pos_query_layer = transform(
+                pos_query_layer = _transform_for_scores(
                     self.query_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
                 )
             else:
                 if "c2p" in self.pos_att_type:
-                    pos_key_layer = transform(
+                    pos_key_layer = _transform_for_scores(
                         self.pos_key_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
                     )
                 else:
                     pos_key_layer = None
                 if "p2c" in self.pos_att_type:
-                    pos_query_layer = transform(
+                    pos_query_layer = _transform_for_scores(
                         self.pos_query_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
                     )
                 else:
@@ -249,18 +262,18 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
         causal = False
         if self.train and not varlen:
-            query_layer = transform(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
-            key_layer = transform(key_layer, self.num_attention_heads)
-            value_layer = transform(value_layer, self.num_attention_heads)
+            query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
+            key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
+            value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
 
-            bias = self.disentangled_attention_bias(query_layer, key_layer, relative_pos, rel_embeddings,
+            bias = self.disentangled_attention_bias_local(query_layer, key_layer, relative_pos, rel_embeddings,
                                                             scale_factor, pos_key_layer, pos_query_layer, attention_mask)
             out = flash_attention_with_bias(query_layer, key_layer, value_layer, bias, sm_scale=sm_scale)
 
         elif not varlen:
-            query_layer = transform(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
-            key_layer = transform(key_layer, self.num_attention_heads)
-            value_layer = transform(value_layer, self.num_attention_heads)
+            query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
+            key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
+            value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
 
             if "c2p" in self.pos_att_type:
                 pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
@@ -279,9 +292,9 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 self.max_relative_positions,
             )
         else:
-            query_layer = get_heads(query_layer, self.num_attention_heads) # (B, L, NH, head_dim)
-            key_layer = get_heads(key_layer, self.num_attention_heads)
-            value_layer = get_heads(value_layer, self.num_attention_heads)
+            query_layer = _get_heads(query_layer, self.num_attention_heads) # (B, L, NH, head_dim)
+            key_layer = _get_heads(key_layer, self.num_attention_heads)
+            value_layer = _get_heads(value_layer, self.num_attention_heads)
 
             if "c2p" in self.pos_att_type:
                 # query_layer = (1, NH, L, head_dim)
@@ -333,12 +346,14 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 self.position_buckets,
                 self.max_relative_positions,
             )
-            out =  pad_input(out_unpad, indices_q, B, L).transpose(1, 2)
+            out =  pad_input(out_unpad, indices_q, B, L).transpose(1, 2).reshape(B, L, self.all_head_size)
+            return (out, None)
+            
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)
 
 
-    def disentangled_attention_bias(self, query_layer, key_layer, relative_pos, rel_embeddings, scale_factor,
+    def disentangled_attention_bias_local(self, query_layer, key_layer, relative_pos, rel_embeddings, scale_factor,
                                      pos_key_layer=None, pos_query_layer=None, attention_mask=None):
         """
         Compute disentangled attention bias using einsum for cleaner tensor operations.
@@ -433,7 +448,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 mask = attention_mask.unsqueeze(1)  # (B, 1, L, L)
 
             # Convert to additive bias: 0 positions become -inf
-            mask_bias = (1.0 - mask.to(score.dtype)) * torch.finfo(score.dtype).min
+            mask_bias = (1.0 - mask.to(query_layer.dtype)) * torch.finfo(query_layer.dtype).min
             score = score + mask_bias
 
         return score
@@ -446,56 +461,19 @@ DEBERTA_SELF_ATTENTION_CLASSES = {
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
         super().__init__(config)
-        # self.self = DEBERTA_SELF_ATTENTION_CLASSES[config._attn_implementation](config)
         self.self = FlashDisentangledSelfAttention(config)
-        self.output = DebertaV2SelfOutput(config)
-        self.config = config
 
 
 class FlashDebertaV2Layer(DebertaV2Layer):
     def __init__(self, config):
         super().__init__(config)
         self.attention = FlashDebertaV2Attention(config)
-        self.intermediate = DebertaV2Intermediate(config)
-        self.output = DebertaV2Output(config)
 
 
 class FlashDebertaV2Encoder(DebertaV2Encoder):
     def __init__(self, config):
         super().__init__(config)
-
         self.layer = nn.ModuleList([FlashDebertaV2Layer(config) for _ in range(config.num_hidden_layers)])
-        self.relative_attention = getattr(config, "relative_attention", False)
-
-        if self.relative_attention:
-            self.max_relative_positions = getattr(config, "max_relative_positions", -1)
-            if self.max_relative_positions < 1:
-                self.max_relative_positions = config.max_position_embeddings
-
-            self.position_buckets = getattr(config, "position_buckets", -1)
-            pos_ebd_size = self.max_relative_positions * 2
-
-            if self.position_buckets > 0:
-                pos_ebd_size = self.position_buckets * 2
-
-            self.rel_embeddings = nn.Embedding(pos_ebd_size, config.hidden_size)
-
-        self.norm_rel_ebd = [x.strip() for x in getattr(config, "norm_rel_ebd", "none").lower().split("|")]
-
-        if "layer_norm" in self.norm_rel_ebd:
-            self.LayerNorm = LayerNorm(config.hidden_size, config.layer_norm_eps, elementwise_affine=True)
-
-        self.conv = ConvLayer(config) if getattr(config, "conv_kernel_size", 0) > 0 else None
-        self.gradient_checkpointing = False
-
-    def get_attention_mask(self, attention_mask):
-        if attention_mask.dim() <= 2:
-            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attention_mask = extended_attention_mask * extended_attention_mask.squeeze(-2).unsqueeze(-1)
-        elif attention_mask.dim() == 3:
-            attention_mask = attention_mask.unsqueeze(1)
-
-        return attention_mask
 
 class FlashDebertaV2PreTrainedModel(PreTrainedModel):
     """

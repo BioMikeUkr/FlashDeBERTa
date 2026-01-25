@@ -76,6 +76,7 @@ class IndexFirstAxis(torch.autograd.Function):
 index_first_axis = IndexFirstAxis.apply
 
 
+@torch.compiler.disable  # .item() causes graph breaks
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -110,6 +111,8 @@ def unpad_input(hidden_states, attention_mask):
         max_seqlen_in_batch,
     )
 
+
+@torch.compiler.disable 
 def _upad_input(query_layer, key_layer, value_layer, pos_key, pos_query, attention_mask, query_length, NH):
     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
     batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape

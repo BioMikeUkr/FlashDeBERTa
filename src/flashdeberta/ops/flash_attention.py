@@ -3,6 +3,7 @@ import torch
 import triton
 import warnings
 import triton.language as tl
+import functools
 
 def calculate_shared_memory_usage(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_stages, dtype, 
                                  has_c2p=False, has_p2c=False, ATT_SPAN=0):
@@ -143,6 +144,112 @@ def calculate_shared_memory_usage_bwd(
 def cdiv(a, b):
     return (a + b - 1) // b
 
+@functools.lru_cache(maxsize=128)
+def _get_fwd_config_cached(B, H, M, N, D, causal, disentangled, att_span):
+    """
+    Cached version of configuration computation for forward pass.
+    """
+    import os
+    if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
+                                          'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
+        return (
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_M']),
+            int(os.environ['FLASHDEBERTA_FWD_BLOCK_N']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
+            int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
+        )
+
+    capability_map = {
+         (7,0): 96000,
+         (7,2): 96000,
+         (7,5): 64000,
+         (8,0): 163000,
+         (8,6): 99000,
+         (8,7): 163000,
+         (8,9): 99000,
+         (9,0): 227000,
+         }
+
+    capability = torch.cuda.get_device_capability()
+    device_property = torch.cuda.get_device_properties()
+    if hasattr(device_property,"shared_memory_per_block_optin"):
+        shared_mem_per_block = device_property.shared_memory_per_block_optin
+    elif capability in list(capability_map.keys()):
+        shared_mem_per_block = capability_map[capability]
+    elif capability[0] >= 8:
+        shared_mem_per_block = 99000
+    else:
+        shared_mem_per_block = 48000
+
+    max_shared_memory = shared_mem_per_block - 2000
+
+    if capability[0] >= 8:
+        if M <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif M <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif M <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                if M <= 1024:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
+        else:
+            if D <= 64:
+                if disentangled:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
+            else:
+                if M <= 1024:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
+    elif capability[0] == 8:
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+        else:
+            if D <= 64:
+                if disentangled:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+    else:
+        BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 10, 4
+
+    has_pos = disentangled
+    ATT_SPAN = att_span if has_pos else 0
+
+    dtype = torch.float16
+
+    shared_mem_usage = calculate_shared_memory_usage(
+        BLOCK_M, BLOCK_N, D, num_stages, dtype,
+        has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+    )
+
+    while shared_mem_usage > max_shared_memory and (BLOCK_M > 16 or BLOCK_N > 16 or num_stages > 1):
+        if num_stages > 1:
+            num_stages -= 1
+        else:
+            BLOCK_M //= 2
+            BLOCK_N //= 2
+
+        shared_mem_usage = calculate_shared_memory_usage(
+            BLOCK_M, BLOCK_N, D, num_stages, dtype,
+            has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+        )
+
+    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
 @triton.jit
 def _fwd_kernel_deberta_disentangled_attention(
     Q, K, V,
@@ -196,12 +303,6 @@ def _fwd_kernel_deberta_disentangled_attention(
         q = tl.load(q_ptrs, cache_modifier=".cg")
     else:
         q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
-
-    if BLOCK_DMODEL < 128:
-        I = tl.where(offs_k[:, None] == offs_k,
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 1.0, dtype=q.dtype),
-                     tl.full((BLOCK_DMODEL, BLOCK_DMODEL), 0.0, dtype=q.dtype))
-        q = tl.dot(q, I).to(q.dtype)
 
     m_i = tl.full([BLOCK_M], value=-float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -313,112 +414,10 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
     Returns:
         Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
     """
-    # Check environment variables first for user override
-    import os
-    if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
-                                          'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
-        return (
-            int(os.environ['FLASHDEBERTA_FWD_BLOCK_M']),
-            int(os.environ['FLASHDEBERTA_FWD_BLOCK_N']),
-            int(os.environ['FLASHDEBERTA_FWD_NUM_STAGES']),
-            int(os.environ['FLASHDEBERTA_FWD_NUM_WARPS'])
-        )
-
-    # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
-
-    capability_map = {
-         (7,0): 96000,
-         (7,2): 96000,
-         (7,5): 64000,
-         (8,0): 163000,
-         (8,6): 99000,
-         (8,7): 163000,
-         (8,9): 99000,
-         (9,0): 227000,
-         }
-    
-    capability = torch.cuda.get_device_capability() 
-    device_property = torch.cuda.get_device_properties()
-    if hasattr(device_property,"shared_memory_per_block_optin"):
-        shared_mem_per_block = device_property.shared_memory_per_block_optin
-    elif capability in list(capability_map.keys()):
-        shared_mem_per_block = capability_map[capability]
-    elif capability[0] >= 8:
-        shared_mem_per_block = 99000
-    else:
-        shared_mem_per_block = 48000
-
-    max_shared_memory = shared_mem_per_block - 2000 # remove 2kb for ops overhead
-
-    # Start with an aggressive configuration
-    if capability[0] >= 8 :
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
-            else:
-                if M <= 1024:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-        else:  # causal
-            if D <= 64:
-                if disentangled:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
-            else:
-                if M <= 1024:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-    elif capability[0] == 8:
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-        else:  # causal
-            if D <= 64:
-                if disentangled:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-    else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 10, 4
-    
-    # Calculate shared memory usage with current config
-    has_pos = disentangled
-    ATT_SPAN = att_span if has_pos else 0 
-    
-    dtype = torch.float16
-
-    shared_mem_usage = calculate_shared_memory_usage(
-        BLOCK_M, BLOCK_N, D, num_stages, dtype, 
-        has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
-    )
-    
-    # If shared memory usage exceeds available, adjust parameters
-    # We prioritize reducing num_stages first, then block sizes
-    while shared_mem_usage > max_shared_memory and (BLOCK_M > 16 or BLOCK_N > 16 or num_stages > 1):
-        # First try reducing num_stages
-        if num_stages > 1:
-            num_stages -= 1
-        # Then try reducing block sizes
-        else:
-            BLOCK_M //= 2
-            BLOCK_N //= 2
-        
-        # Recalculate with new parameters
-        shared_mem_usage = calculate_shared_memory_usage(
-            BLOCK_M, BLOCK_N, D, num_stages, dtype,
-            has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
-        )
-
-    warnings.warn(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.\n"
-                  "INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
-    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    config = _get_fwd_config_cached(B, H, M, N, D, causal, disentangled, att_span)
+    warnings.warn(f"INFO: Forward config is {config[0]}, {config[1]}, {config[2]}, {config[3]} for BLOCK_M, BLOCK_N stages and warps, respectively.\n"
+                  "INFO: If you want to change it, feel free to check ops/flash_attention")
+    return config
 
 
 def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_M, BLOCK_N,
@@ -490,19 +489,14 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
 
     return o, L
 
-def get_bwd_config(
-    B, H, M, N, D, causal,
-    *,
-    disentangled: bool = False,
-    att_span: int = 256,
-    dtype = torch.float16,
-    max_shared_memory: int | None = None,
+@functools.lru_cache(maxsize=128)
+def _get_bwd_config_cached(
+    B, H, M, N, D, causal, disentangled, att_span, dtype_size
 ):
     """
-    Heuristic selector for backward kernel tiling.
-    Returns (BLOCK_M, BLOCK_N, num_stages, num_warps).
+    Cached version of configuration computation for backward pass.
+    dtype_size: 2 for float16/bfloat16, 4 for float32
     """
-    # Check environment variables first for user override
     import os
     if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
                                           'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
@@ -521,39 +515,53 @@ def get_bwd_config(
     cap = torch.cuda.get_device_capability()
     prop = torch.cuda.get_device_properties(0)
 
-    if max_shared_memory is None:
-        if hasattr(prop, "shared_memory_per_block_optin"):
-            shared_mem_per_block = prop.shared_memory_per_block_optin
-        elif cap in capability_map:
-            shared_mem_per_block = capability_map[cap]
-        elif cap[0] >= 8:
-            shared_mem_per_block = 99000
-        else:
-            shared_mem_per_block = 48000
-        max_shared_memory = max(0, shared_mem_per_block - 2048)
-
-    if cap[0] >= 9:
-        if D <= 64:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if not causal else (64, 64, 3, 4)
-        else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 2, 8) if not causal else (64, 64, 2, 8)
+    if hasattr(prop, "shared_memory_per_block_optin"):
+        shared_mem_per_block = prop.shared_memory_per_block_optin
+    elif cap in capability_map:
+        shared_mem_per_block = capability_map[cap]
     elif cap[0] >= 8:
-        if D <= 64:
-            if causal:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+        shared_mem_per_block = 99000
+    else:
+        shared_mem_per_block = 48000
+    max_shared_memory = max(0, shared_mem_per_block - 2048)
+
+    if cap[0] >= 8:
+        if M <= 64:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 2, 4
+        elif M <= 128:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+        elif M <= 256:
+            BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 2, 4
+        elif cap[0] >= 9:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 3, 4) if not causal else (64, 64, 3, 4)
             else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                BLOCK_M, BLOCK_N, num_stages, num_warps = (64, 64, 2, 8) if not causal else (64, 64, 2, 8)
         else:
-            BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 8
+            if D <= 64:
+                if causal:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 2, 8
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
 
-    if N >= 2 * M and BLOCK_N < 128 and cap[0] >= 8:
+    if M > 256 and N >= 2 * M and BLOCK_N < 128 and cap[0] >= 8:
         BLOCK_N = 128
         num_warps = max(num_warps, 8)
 
     has_pos = bool(disentangled)
     ATT_SPAN = att_span if has_pos else 0
+
+    # Convert dtype_size back to dtype for calculation
+    if dtype_size == 2:
+        dtype = torch.float16
+    elif dtype_size == 4:
+        dtype = torch.float32
+    else:
+        dtype = torch.float16
 
     shm = calculate_shared_memory_usage_bwd(
         BLOCK_M, BLOCK_N, D, num_stages, dtype,
@@ -561,12 +569,9 @@ def get_bwd_config(
         store_lse=True, recompute_probs=True, accum_dq=True, accum_dkv=True,
     )
 
-    def halve_pow2(x): return max(16, (x // 2)) if x > 16 else 16
-
     while shm > max_shared_memory and (num_stages > 1 or BLOCK_M > 16 or BLOCK_N > 16):
         if num_stages > 1:
             num_stages -= 1
-        # Then try reducing block sizes
         else:
             BLOCK_M //= 2
             BLOCK_N //= 2
@@ -576,18 +581,43 @@ def get_bwd_config(
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN,
             store_lse=True, recompute_probs=True, accum_dq=True, accum_dkv=True,
         )
+
     if D <= 64 and BLOCK_M * BLOCK_N <= 128 * 64:
         num_warps = min(num_warps, 4)
     else:
         num_warps = max(num_warps, 8 if cap[0] >= 8 else 4)
 
+    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_bwd_config(
+    B, H, M, N, D, causal,
+    *,
+    disentangled: bool = False,
+    att_span: int = 256,
+    dtype = torch.float16,
+    max_shared_memory: int | None = None,
+):
+    """
+    Heuristic selector for backward kernel tiling.
+    Returns (BLOCK_M, BLOCK_N, num_stages, num_warps).
+    """
+    # Convert dtype to size for caching (dtypes are not hashable)
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        dtype_size = 2
+    elif dtype == torch.float32:
+        dtype_size = 4
+    else:
+        dtype_size = 2
+
+    config = _get_bwd_config_cached(B, H, M, N, D, causal, disentangled, att_span, dtype_size)
+
     warnings.warn(
-        f"INFO: Varlen backward config -> "
-        f"BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, stages={num_stages}, warps={num_warps}."
+        f"INFO: Backward config -> "
+        f"BLOCK_M={config[0]}, BLOCK_N={config[1]}, stages={config[2]}, warps={config[3]}."
         "\nINFO: Adjust att_span/disentangled or set max_shared_memory to tune."
     )
 
-    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    return config
 
 @triton.jit
 def _bwd_preprocess(
@@ -1100,3 +1130,8 @@ def flash_attention_with_disentangled(q, k, v, k_pos, q_pos, causal=False, sm_sc
                                       position_buckets=0, max_relative_distance=0):
     return FlashAttentionDisentangled.apply(q, k, v, k_pos, q_pos, causal, sm_scale,
                                             position_buckets, max_relative_distance)
+
+def clear_config_cache():
+    """Clear the configuration cache. Call this if you change devices or need to reset cached configurations."""
+    _get_fwd_config_cached.cache_clear()
+    _get_bwd_config_cached.cache_clear()
