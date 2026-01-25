@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import triton
@@ -404,7 +405,6 @@ def _get_fwd_config_cached(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, 
     """
     Cached version of configuration computation for variable-length forward pass.
     """
-    import os
     if all(key in os.environ for key in ['FLASHDEBERTA_FWD_BLOCK_M', 'FLASHDEBERTA_FWD_BLOCK_N',
                                           'FLASHDEBERTA_FWD_NUM_STAGES', 'FLASHDEBERTA_FWD_NUM_WARPS']):
         return (
@@ -632,7 +632,6 @@ def _get_bwd_config_varlen_cached(total_tokens_q, total_tokens_k, max_seqlen_q, 
     Cached version of configuration computation for variable-length backward pass.
     dtype_size: 2 for float16/bfloat16, 4 for float32
     """
-    import os
     if all(key in os.environ for key in ['FLASHDEBERTA_BWD_BLOCK_M', 'FLASHDEBERTA_BWD_BLOCK_N',
                                           'FLASHDEBERTA_BWD_NUM_STAGES', 'FLASHDEBERTA_BWD_NUM_WARPS']):
         return (
@@ -1264,4 +1263,3 @@ def flash_attention_with_disentangled_varlen(
         max_seqlen_q, max_seqlen_k, causal, sm_scale,
         position_buckets, max_relative_distance
     )
-
