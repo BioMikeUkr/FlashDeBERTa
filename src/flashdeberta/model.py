@@ -249,7 +249,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
 
         causal = False
-        if self.train and (512<L<2048):
+        if self.train and (512<L<1024) and B<4:
             query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
             key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
             value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
