@@ -84,6 +84,9 @@ While context-to-position and position-to-context biases still require quadratic
 
 ![benchmarking](images/benchmarking.png)
 
+Below, you can find a breakdown of inference and training speed gains together with growing memory efficiency for the [DeBERTa-based model](https://huggingface.co/knowledgator/gliclass-small-v1.0) evaluated during inference and training on different batch sizes and sequence lengths.
+![gliclass_benchmarking](images/flash_attention_benchmark.png)
+
 ### Future Work
 
 - Implement backward kernels.
