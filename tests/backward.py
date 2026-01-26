@@ -19,6 +19,7 @@ class DummyConfig:
 
 def _make_varlen_mask(B, L, device, min_len=1):
     lengths = torch.randint(low=min_len, high=L + 1, size=(B,), device=device)
+    lengths[0] = L
     mask = torch.zeros(B, L, device=device, dtype=torch.bool)
     for b, t in enumerate(lengths.tolist()):
         mask[b, :t] = True
@@ -325,7 +326,7 @@ def compare_flash_and_deberta_backward(
 # Example
 if __name__ == "__main__":
     _ = compare_flash_and_deberta_backward(
-        B=2, L=4096, hidden_size=768,
+        B=4, L=1024, hidden_size=768,
         pos_att_type=["p2c", "c2p"],
         varlen=True, verbose=True, print_top_k=30
     )

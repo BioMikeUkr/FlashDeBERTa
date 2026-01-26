@@ -169,8 +169,6 @@ class DebertaV2Config(PretrainedConfig):
         self.legacy = legacy
 
 class FlashDisentangledSelfAttention(DisentangledSelfAttention):
-    FLASH_SEQLEN_THRESHOLD = int(__import__('os').environ.get('FLASHDEBERTA_SEQLEN_THRESHOLD', 512)) 
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -205,21 +203,10 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         else:
             varlen = False
 
-        B, L, _ = hidden_states.shape
-
-        seq_len = hidden_states.size(1)
-        if seq_len < self.FLASH_SEQLEN_THRESHOLD and varlen:
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                output_attentions=output_attentions,
-                query_states=query_states,
-                relative_pos=relative_pos,
-                rel_embeddings=rel_embeddings,
-            )
-        
         if query_states is None:
             query_states = hidden_states
+
+        B, L, _ = hidden_states.shape
 
         query_layer = self.query_proj(query_states)
         key_layer = self.key_proj(hidden_states)
@@ -260,8 +247,9 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         else:
             pos_key, pos_query, pos_key_layer, pos_query_layer = None, None, None, None
 
+
         causal = False
-        if self.train and not varlen:
+        if self.train and (512<L<1024) and B<4:
             query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
             key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
             value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
@@ -270,7 +258,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                                                             scale_factor, pos_key_layer, pos_query_layer, attention_mask)
             out = flash_attention_with_bias(query_layer, key_layer, value_layer, bias, sm_scale=sm_scale)
 
-        elif not varlen:
+        elif not varlen or L<1024:
             query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
             key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
             value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
@@ -280,10 +268,24 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             if "p2c" in self.pos_att_type:
                 pos_query = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2))
 
+            # Compute sequence lengths from attention mask if available
+            seq_lengths = None
+            if varlen and attention_mask is not None:
+                if attention_mask.dim() == 4:
+                    # [B, 1, L, L] -> [B, L] -> sum per batch
+                    seq_lengths = (attention_mask[:, 0, 0, :] > 0).sum(dim=-1).to(torch.int32)
+                elif attention_mask.dim() == 3:
+                    # [B, L, L] -> sum per batch
+                    seq_lengths = (attention_mask[:, 0, :] > 0).sum(dim=-1).to(torch.int32)
+                elif attention_mask.dim() == 2:
+                    # [B, L] -> sum per batch
+                    seq_lengths = (attention_mask > 0).sum(dim=-1).to(torch.int32)
+
             out = flash_attention_with_disentangled(
                 query_layer,
                 key_layer,
                 value_layer,
+                seq_lengths,
                 pos_key,
                 pos_query,
                 causal,
@@ -346,9 +348,8 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 self.position_buckets,
                 self.max_relative_positions,
             )
-            out =  pad_input(out_unpad, indices_q, B, L).transpose(1, 2).reshape(B, L, self.all_head_size)
+            out = pad_input(out_unpad, indices_q, B, L).view(B, L, self.all_head_size)
             return (out, None)
-            
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)
 
